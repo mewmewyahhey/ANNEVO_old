@@ -1,0 +1,5 @@
+python=3.10.19
+platform=Linux-6.6.114.1-microsoft-standard-WSL2-x86_64-with-glibc2.39
+torch=2.11.0.dev20251215+cu128
+torch_cuda=12.8
+

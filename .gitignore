@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+logs/
+output/
+output1/
+tmp/
+fna/
+fna1/
+fna_tba/
+
+*.h5
+*.log
