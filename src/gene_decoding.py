@@ -2,11 +2,22 @@ import numpy as np
 from Bio import SeqIO
 import h5py
 from src.predict_nucleotide import reverse_complement
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from collections import defaultdict
 import pandas as pd
 from src.HMM import viterbi_decoding, define_state
 import time
+
+
+def log_decode(message):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+
+
+def describe_segment(region):
+    location_start, location_end, seq_id, strand, _, _ = region
+    if location_start is None:
+        return f"{seq_id}:no_candidate strand={strand}"
+    return f"{seq_id}:{location_start}-{location_end} strand={strand} length={location_end - location_start}"
 
 
 def detect_gene_location(base_predictions, seq_length, min_threshold, max_threshold):
@@ -171,23 +182,14 @@ def decode_gene_structure(location_start, predictions, sequence, min_cds_length,
     return filtered_gene_list
 
 
-def process_gene_segment(region, model_prediction_path, min_cds_length, min_cds_score, min_intron_length, at_ac_splicing):
+def process_gene_segment(region, min_cds_length, min_cds_score, min_intron_length, at_ac_splicing):
     location_start, location_end, seq_id, strand, prediction_slice, sequence_slice = region
 
     if location_start is None:
         gene_list = []
     else:
-        with h5py.File(model_prediction_path, 'r') as f:
-            if strand == 1:
-                prediction_slice = f[seq_id]['predictions_forward'][location_start:location_end]
-            else:
-                prediction_slice = f[seq_id]['predictions_reverse'][location_start:location_end]
-
-        sequence_forward = str(_global_genome_seq[seq_id].seq).upper()
-        if strand == 1:
-            sequence_slice = sequence_forward[location_start:location_end]
-        else:
-            sequence_slice = reverse_complement(sequence_forward)[location_start:location_end]
+        if prediction_slice is None or sequence_slice is None:
+            raise ValueError(f"Missing in-memory payload for {seq_id}:{location_start}-{location_end} strand={strand}")
 
         gene_list = decode_gene_structure(
             location_start,
@@ -246,23 +248,80 @@ def write_result(file, num, seq_id, result, length, strand):
     file.write(f'###\n')
 
 
-def decode_and_write(potential_gene_list, chromosome_length, model_prediction_path, seq_num, cpu_num, min_cds_length, min_cds_score, min_intron_length, at_ac_splicing, output):
+def decode_and_write(potential_gene_list, chromosome_length, seq_num, cpu_num, min_cds_length, min_cds_score, min_intron_length, at_ac_splicing, output):
     results = []
-    with ProcessPoolExecutor(max_workers=cpu_num) as executor:
-        future_to_segment = {executor.submit(process_gene_segment, region, model_prediction_path, min_cds_length, min_cds_score, min_intron_length, at_ac_splicing): region for region in potential_gene_list}
-        for future in as_completed(future_to_segment):
+    total_segments = len(potential_gene_list)
+    max_segment_length = max((region[1] - region[0] for region in potential_gene_list if region[0] is not None), default=0)
+    log_decode(f"Decoding segment batch with {total_segments} segments using {cpu_num} worker(s); max_segment_length={max_segment_length}")
+    batch_start_time = time.time()
+    if cpu_num <= 1:
+        for idx, region in enumerate(potential_gene_list, 1):
             try:
-                result = future.result()
+                result = process_gene_segment(region, min_cds_length, min_cds_score, min_intron_length, at_ac_splicing)
                 results.append(result)
             except Exception as e:
-                print(f"Process failed: {str(e)}")
+                log_decode(f"Process failed: {str(e)}")
                 continue
+            if idx % 100 == 0 or idx == total_segments:
+                elapsed = time.time() - batch_start_time
+                rate = idx / elapsed if elapsed > 0 else 0
+                log_decode(f"Decoded segments: {idx}/{total_segments}; elapsed={elapsed:.1f}s; rate={rate:.2f} segment/s")
+    else:
+        max_pending = max(cpu_num * 2, 1)
+        next_segment_index = 0
+        completed_segments = 0
+        last_wait_log_time = time.time()
+
+        def submit_until_full(executor, pending):
+            nonlocal next_segment_index
+            while next_segment_index < total_segments and len(pending) < max_pending:
+                region = potential_gene_list[next_segment_index]
+                next_segment_index += 1
+                future = executor.submit(process_gene_segment, region, min_cds_length, min_cds_score, min_intron_length, at_ac_splicing)
+                pending[future] = region
+
+        with ProcessPoolExecutor(max_workers=cpu_num) as executor:
+            pending = {}
+            submit_until_full(executor, pending)
+            while pending:
+                done, _ = wait(pending, timeout=60, return_when=FIRST_COMPLETED)
+                if not done:
+                    now = time.time()
+                    if now - last_wait_log_time >= 60:
+                        examples = "; ".join(describe_segment(region) for region in list(pending.values())[:5])
+                        log_decode(
+                            "No segment completed in the last 60s; "
+                            f"completed={completed_segments}/{total_segments}; "
+                            f"submitted={next_segment_index}/{total_segments}; "
+                            f"pending={len(pending)}; examples={examples}"
+                        )
+                        last_wait_log_time = now
+                    continue
+
+                for future in done:
+                    region = pending.pop(future)
+                    completed_segments += 1
+                    idx = completed_segments
+                    try:
+                        result = future.result()
+                        results.append(result)
+                    except Exception as e:
+                        log_decode(f"Process failed for segment={describe_segment(region)}: {str(e)}")
+                        continue
+
+                    if idx % 100 == 0 or idx == total_segments:
+                        elapsed = time.time() - batch_start_time
+                        rate = idx / elapsed if elapsed > 0 else 0
+                        log_decode(f"Decoded segments: {idx}/{total_segments}; elapsed={elapsed:.1f}s; rate={rate:.2f} segment/s")
+
+                submit_until_full(executor, pending)
 
     grouped_results = defaultdict(list)
     for gene_set, seq_id, strand in results:
         decode_gene = (gene_set, strand)
         grouped_results[seq_id].append(decode_gene)
 
+    log_decode(f"Writing decoded GFF records to {output}")
     with open(output, 'a') as file:
         for chromosome in grouped_results:
             gene_list_forward = []
@@ -302,6 +361,7 @@ def decode_and_write(potential_gene_list, chromosome_length, model_prediction_pa
                     gene_num += 1
                     file.flush()
             seq_num += 1
+    log_decode(f"Finished segment batch; total_elapsed={time.time() - batch_start_time:.1f}s")
     return seq_num
 
 
@@ -332,8 +392,8 @@ def get_gene_region(genome_predictions, genome_seq, average_threshold, max_thres
             for location_start, location_end in potential_gene_chromosome_forward:
                 potential_gene_list.append(
                     (location_start, location_end, chromosome, 1,
-                     None,
-                     None)
+                     predictions_forward[location_start:location_end].copy(),
+                     sequence_forward[location_start:location_end])
                 )
         potential_gene_chromosome_reverse = detect_gene_location(predictions_reverse, length, average_threshold, max_threshold)
         if not potential_gene_chromosome_reverse:
@@ -344,8 +404,8 @@ def get_gene_region(genome_predictions, genome_seq, average_threshold, max_thres
             for location_start, location_end in potential_gene_chromosome_reverse:
                 potential_gene_list.append(
                     (location_start, location_end, chromosome, -1,
-                     None,
-                     None)
+                     predictions_reverse[location_start:location_end].copy(),
+                     sequence_reverse[location_start:location_end])
                 )
 
         # potential_gene_chromosome_forward = detect_gene_location(predictions_forward, length, average_threshold, max_threshold)
@@ -376,10 +436,10 @@ def get_gene_region(genome_predictions, genome_seq, average_threshold, max_thres
 
 
 def gene_structure_decoding(genome, model_prediction_path, genome_size_threshold, output, cpu_num, average_threshold, max_threshold, min_cds_length, min_cds_score, min_intron_length, at_ac_splicing):
+    log_decode(f"Loading genome: {genome}")
     with open(genome) as fna:
         genome_seq = SeqIO.to_dict(SeqIO.parse(fna, "fasta"))
-    global _global_genome_seq
-    _global_genome_seq = genome_seq
+    log_decode(f"Loaded {len(genome_seq)} genome sequences")
     with open(output, 'w') as file:
         file.write('# This output was generated with ANNEVO (v2.2).\n')
         file.write('# ANNEVO is an ab initio gene annotation tool written by YeLab.\n')
@@ -390,26 +450,34 @@ def gene_structure_decoding(genome, model_prediction_path, genome_size_threshold
     genome_predictions = {}
 
     with h5py.File(f'{model_prediction_path}', 'r') as h5file:
-        for chr_name in h5file.keys():
-            start_time = time.time()
+        chr_names = list(h5file.keys())
+    log_decode(f"Prediction H5 has {len(chr_names)} sequence groups: {model_prediction_path}")
+    for chr_name in chr_names:
+        start_time = time.time()
+        with h5py.File(f'{model_prediction_path}', 'r') as h5file:
             chr_group = h5file[chr_name]
             predictions_forward = np.array(chr_group['predictions_forward'])
             predictions_reverse = np.array(chr_group['predictions_reverse'])
-            end_time = time.time()
-            file_loading_time += (end_time - start_time)
-            genome_predictions[chr_name] = [predictions_forward, predictions_reverse]
-            cumulative_size += len(predictions_forward)
+        end_time = time.time()
+        file_loading_time += (end_time - start_time)
+        genome_predictions[chr_name] = [predictions_forward, predictions_reverse]
+        cumulative_size += len(predictions_forward)
+        log_decode(f"Loaded predictions for {chr_name}: length={len(predictions_forward)} cumulative_size={cumulative_size}")
 
-            if cumulative_size > genome_size_threshold:
-                chromosome_length, potential_gene_list = get_gene_region(genome_predictions, genome_seq, average_threshold, max_threshold)
-                del genome_predictions
-                seq_num = decode_and_write(potential_gene_list, chromosome_length, model_prediction_path, seq_num, cpu_num, min_cds_length, min_cds_score, min_intron_length, at_ac_splicing, output)
-                # Reinitialization
-                cumulative_size = 0
-                genome_predictions = {}
-        if genome_predictions:
+        if cumulative_size > genome_size_threshold:
+            log_decode(f"Building candidate gene segments for decode chunk cumulative_size={cumulative_size}")
             chromosome_length, potential_gene_list = get_gene_region(genome_predictions, genome_seq, average_threshold, max_threshold)
             del genome_predictions
-            seq_num = decode_and_write(potential_gene_list, chromosome_length, model_prediction_path, seq_num, cpu_num, min_cds_length, min_cds_score, min_intron_length, at_ac_splicing, output)
+            log_decode(f"Candidate gene segments: {len(potential_gene_list)}")
+            seq_num = decode_and_write(potential_gene_list, chromosome_length, seq_num, cpu_num, min_cds_length, min_cds_score, min_intron_length, at_ac_splicing, output)
+            # Reinitialization
+            cumulative_size = 0
+            genome_predictions = {}
+    if genome_predictions:
+        log_decode(f"Building candidate gene segments for final decode chunk cumulative_size={cumulative_size}")
+        chromosome_length, potential_gene_list = get_gene_region(genome_predictions, genome_seq, average_threshold, max_threshold)
+        del genome_predictions
+        log_decode(f"Candidate gene segments: {len(potential_gene_list)}")
+        seq_num = decode_and_write(potential_gene_list, chromosome_length, seq_num, cpu_num, min_cds_length, min_cds_score, min_intron_length, at_ac_splicing, output)
 
-    print(f"file loading cost {file_loading_time:.1f} seconds")
+    log_decode(f"file loading cost {file_loading_time:.1f} seconds")
